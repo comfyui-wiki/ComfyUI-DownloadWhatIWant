@@ -16,8 +16,8 @@ jobs:
         id: version_check
         run: |
           set -e
-          OLD_VERSION=$(git show HEAD^:pyproject.toml 2>/dev/null | grep '^version' | sed 's/.*"//' | sed 's/".*//')
-          NEW_VERSION=$(grep '^version' pyproject.toml | sed 's/.*"//' | sed 's/".*//')
+          OLD_VERSION=$(git show HEAD^:pyproject.toml 2>/dev/null | grep '^version' | sed 's/[^"]*"//' | sed 's/".*//' || true)
+          NEW_VERSION=$(grep '^version' pyproject.toml | sed 's/[^"]*"//' | sed 's/".*//')
           echo "old=${OLD_VERSION}"
           echo "new=${NEW_VERSION}"
           if [ "$OLD_VERSION" != "$NEW_VERSION" ]; then
