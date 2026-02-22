@@ -1,0 +1,15 @@
+[project]
+name = "downloadwhatiwant"
+description = "A custom node that use for donwload models, fork from @Kosinkadink"
+version = "1.0.0"
+license = {file = "LICENSE"}
+
+[project.urls]
+Repository = "https://github.com/comfyui-wiki/ComfyUI-DownloadWhatIWant"
+#  Used by Comfy Registry https://registry.comfy.org
+
+[tool.comfy]
+PublisherId = "comfyui-wiki"
+DisplayName = "DownloadWhatIWant"
+Icon = ""
+includes = []
