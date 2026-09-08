@@ -1,18 +1,33 @@
 from __future__ import annotations
+import asyncio
+import logging
 import requests
 from tqdm import tqdm
 import shutil
 import re
 import os
+from urllib.parse import urlparse, urlunparse
 
+from aiohttp import web
 from comfy_api.latest import ComfyExtension, io
 import folder_paths
 import comfy.utils
-import logging
 from server import PromptServer
 import comfy.model_management
 
+# Folder name may contain hyphens, so avoid package-relative imports.
+import importlib.util
 
+_HF_AUTH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hf_auth.py")
+_hf_auth_spec = importlib.util.spec_from_file_location("downloadwhatiwant_hf_auth", _HF_AUTH_PATH)
+hf_auth = importlib.util.module_from_spec(_hf_auth_spec)
+assert _hf_auth_spec.loader is not None
+_hf_auth_spec.loader.exec_module(hf_auth)
+
+
+WEB_DIRECTORY = "./web"
+_HF_AUTH_PREFIX = "/downloadwhatiwant/hf_auth"
+_routes_registered = False
 
 folder_names_and_paths_list = list(folder_paths.folder_names_and_paths.keys())
 
@@ -56,13 +71,104 @@ def _validate_file_extension(file_name):
     if extension not in (".safetensors", ".sft", ".txt", ".csv", ".json", ".yaml"):
         raise ValueError(f"Unsupported unsafe file for download: {file_name}")
 
+def _is_huggingface_url(url: str) -> bool:
+    host = re.sub(r"^https?://", "", url.strip(), flags=re.IGNORECASE).split("/", 1)[0].lower()
+    return (
+        host == "huggingface.co"
+        or host.endswith(".huggingface.co")
+        or host == "hf.co"
+        or host.endswith(".hf.co")
+    )
+
+# Model/dataset/space file pages use /blob/ or /tree/; downloads need /resolve/.
+_HF_VIEWER_PATH_RE = re.compile(
+    r"^/((?:datasets|spaces)/)?([^/]+)/([^/]+)/(blob|tree)/",
+    flags=re.IGNORECASE,
+)
+
+
+def _normalize_huggingface_download_url(url: str) -> str:
+    """Rewrite Hugging Face viewer URLs to the file resolve endpoint."""
+    stripped = url.strip()
+    if not _is_huggingface_url(stripped):
+        return stripped
+    parsed = urlparse(stripped)
+    new_path, replaced = _HF_VIEWER_PATH_RE.subn(r"/\1\2/\3/resolve/", parsed.path, count=1)
+    if replaced == 0:
+        return stripped
+    return urlunparse(parsed._replace(path=new_path))
+
+
+def _filename_from_url(url: str) -> str:
+    path = urlparse(url.strip()).path.rstrip("/")
+    return path.split("/")[-1] if path else ""
+
+def _download_headers(url: str) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if _is_huggingface_url(url):
+        token = hf_auth.get_hf_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _preflight_huggingface_access(url: str, unique_id) -> None:
+    """Look up Hub metadata and tell the user if the repo is gated or private."""
+    if not _is_huggingface_url(url):
+        return
+    info = hf_auth.lookup_hf_repo_gate(url)
+    if not info:
+        return
+
+    has_token = bool(hf_auth.get_hf_token())
+    repo_id = info["repo_id"]
+    page_url = info["page_url"]
+
+    if info.get("inaccessible"):
+        message = (
+            f"{repo_id} looks private or blocked without Hugging Face login. "
+            "Click Hugging Face Login on this node, confirm this account can open "
+            f"{page_url}, then retry."
+        )
+        PromptServer.instance.send_progress_text(message, unique_id)
+        if not has_token:
+            raise PermissionError(message)
+        return
+
+    if not info.get("gated"):
+        return
+
+    notice = f"Gated Hugging Face repo: {repo_id}."
+    PromptServer.instance.send_progress_text(notice, unique_id)
+    if not has_token:
+        raise PermissionError(
+            f"{notice} Click Hugging Face Login on this node, then open {page_url} "
+            "in a browser and accept the license with the same account before retrying."
+        )
+    PromptServer.instance.send_progress_text(
+        f"Using the cached Hugging Face token. If download fails, accept the license at {page_url}.",
+        unique_id,
+    )
+
+
 def _download_file(url, destination_path, hidden: io.HiddenHolder):
     """Download a file."""
-    response = requests.get(url, stream=True)
+    headers = _download_headers(url)
+    response = requests.get(url, stream=True, headers=headers)
+    if response.status_code in (401, 403) and _is_huggingface_url(url):
+        if not headers.get("Authorization"):
+            raise PermissionError(
+                "Hugging Face returned 401/403. This file is probably gated or private. "
+                "Click Hugging Face Login on this node, accept the repo license on the model page, then retry."
+            )
+        raise PermissionError(
+            "Hugging Face returned 401/403 even with a cached token. "
+            "The login may be expired, or this account has not accepted the gated license. "
+            "Open the model page and click Agree, or click Hugging Face Login again."
+        )
+    response.raise_for_status()
     logging.info(f"Downloading {url} to {destination_path}")
     display_modulus = 200
-
-    
 
     with open(destination_path, "wb") as f:
         total_size = int(response.headers.get("content-length", 0))
@@ -92,9 +198,20 @@ class DownloadWhatIWantNode(io.ComfyNode):
         return io.Schema(
             node_id="DownloadWhatIWant",
             display_name="DownloadWhatIWant",
-            description="Download what I want.",
+            description=(
+                "Download what I want. Hugging Face URLs use the cached HF token when available. "
+                "Use the Hugging Face Login button on this node for gated repos. "
+                "Viewer links (/blob/ or /tree/) are rewritten to /resolve/ before download. "
+                "Gated repos are detected before download and shown on the node."
+            ),
             inputs=[
-                io.String.Input("url", tooltip="The URL of the file to download."),
+                io.String.Input(
+                    "url",
+                    tooltip=(
+                        "The URL of the file to download. Hugging Face /blob/ and /tree/ "
+                        "links are converted to /resolve/ automatically."
+                    ),
+                ),
                 io.String.Input("name_override", tooltip="What to call the name after downloading."),
                 io.Combo.Input("folder_name", tooltip="The folder to download the file to.", options=folder_names_and_paths_list),
             ],
@@ -106,6 +223,15 @@ class DownloadWhatIWantNode(io.ComfyNode):
     
     @classmethod
     def execute(cls, url: str, name_override: str, folder_name: str):
+        original_url = url.strip()
+        url = _normalize_huggingface_download_url(original_url)
+        if url != original_url:
+            logging.info(f"Normalized Hugging Face URL: {original_url} -> {url}")
+            PromptServer.instance.send_progress_text(
+                f"Normalized Hugging Face URL to {url}",
+                cls.hidden.unique_id,
+            )
+        _preflight_huggingface_access(url, cls.hidden.unique_id)
         name_override = to_valid_filename(name_override.strip())
         matching_folder_paths = folder_paths.get_folder_paths(folder_name)
         first_folder_path = matching_folder_paths[0]
@@ -113,7 +239,7 @@ class DownloadWhatIWantNode(io.ComfyNode):
             if folder_name in folder_path:
                 first_folder_path = folder_path
                 break
-        filename = url.strip().split("/")[-1]
+        filename = _filename_from_url(url)
         extension = filename.split(".")[-1]
         if extension == "":
             extension = "safetensors"
@@ -142,5 +268,39 @@ class DownloadWhatIWantExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [DownloadWhatIWantNode]
 
+
+def _register_hf_auth_routes() -> None:
+    global _routes_registered
+    if _routes_registered or PromptServer.instance is None:
+        return
+
+    routes = PromptServer.instance.routes
+
+    @routes.get(f"{_HF_AUTH_PREFIX}/status")
+    async def hf_auth_status(request):
+        refresh = request.query.get("refresh") == "1"
+        return web.json_response(hf_auth.login_session.snapshot(refresh_whoami=refresh))
+
+    @routes.post(f"{_HF_AUTH_PREFIX}/start")
+    async def hf_auth_start(request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        force = bool((body or {}).get("force_relogin"))
+        state = await asyncio.to_thread(hf_auth.login_session.start, force)
+        return web.json_response(state)
+
+    @routes.post(f"{_HF_AUTH_PREFIX}/cancel")
+    async def hf_auth_cancel(_request):
+        return web.json_response(hf_auth.login_session.cancel())
+
+    _routes_registered = True
+
+
+_register_hf_auth_routes()
+
+
 async def comfy_entrypoint():
+    _register_hf_auth_routes()
     return DownloadWhatIWantExtension()
