@@ -5,6 +5,7 @@ import shutil
 import re
 import os
 import time
+from urllib.parse import urlparse, urlunparse
 
 from comfy_api.latest import ComfyExtension, io
 import folder_paths
@@ -73,6 +74,29 @@ def _is_huggingface_url(url: str) -> bool:
         or host == "hf.co"
         or host.endswith(".hf.co")
     )
+
+# Model/dataset/space file pages use /blob/ or /tree/; downloads need /resolve/.
+_HF_VIEWER_PATH_RE = re.compile(
+    r"^/((?:datasets|spaces)/)?([^/]+)/([^/]+)/(blob|tree)/",
+    flags=re.IGNORECASE,
+)
+
+
+def _normalize_huggingface_download_url(url: str) -> str:
+    """Rewrite Hugging Face viewer URLs to the file resolve endpoint."""
+    stripped = url.strip()
+    if not _is_huggingface_url(stripped):
+        return stripped
+    parsed = urlparse(stripped)
+    new_path, replaced = _HF_VIEWER_PATH_RE.subn(r"/\1\2/\3/resolve/", parsed.path, count=1)
+    if replaced == 0:
+        return stripped
+    return urlunparse(parsed._replace(path=new_path))
+
+
+def _filename_from_url(url: str) -> str:
+    path = urlparse(url.strip()).path.rstrip("/")
+    return path.split("/")[-1] if path else ""
 
 def _download_headers(url: str) -> dict[str, str]:
     headers: dict[str, str] = {}
@@ -199,9 +223,18 @@ class DownloadWhatIWantNode(io.ComfyNode):
         return io.Schema(
             node_id="DownloadWhatIWant",
             display_name="DownloadWhatIWant",
-            description="Download what I want. Hugging Face URLs use the cached HF token when available.",
+            description=(
+                "Download what I want. Hugging Face URLs use the cached HF token when available. "
+                "Viewer links (/blob/ or /tree/) are rewritten to /resolve/ before download."
+            ),
             inputs=[
-                io.String.Input("url", tooltip="The URL of the file to download."),
+                io.String.Input(
+                    "url",
+                    tooltip=(
+                        "The URL of the file to download. Hugging Face /blob/ and /tree/ "
+                        "links are converted to /resolve/ automatically."
+                    ),
+                ),
                 io.String.Input("name_override", tooltip="What to call the name after downloading."),
                 io.Combo.Input("folder_name", tooltip="The folder to download the file to.", options=folder_names_and_paths_list),
             ],
@@ -213,6 +246,14 @@ class DownloadWhatIWantNode(io.ComfyNode):
     
     @classmethod
     def execute(cls, url: str, name_override: str, folder_name: str):
+        original_url = url.strip()
+        url = _normalize_huggingface_download_url(original_url)
+        if url != original_url:
+            logging.info(f"Normalized Hugging Face URL: {original_url} -> {url}")
+            PromptServer.instance.send_progress_text(
+                f"Normalized Hugging Face URL to {url}",
+                cls.hidden.unique_id,
+            )
         name_override = to_valid_filename(name_override.strip())
         matching_folder_paths = folder_paths.get_folder_paths(folder_name)
         first_folder_path = matching_folder_paths[0]
@@ -220,7 +261,7 @@ class DownloadWhatIWantNode(io.ComfyNode):
             if folder_name in folder_path:
                 first_folder_path = folder_path
                 break
-        filename = url.strip().split("/")[-1]
+        filename = _filename_from_url(url)
         extension = filename.split(".")[-1]
         if extension == "":
             extension = "safetensors"
