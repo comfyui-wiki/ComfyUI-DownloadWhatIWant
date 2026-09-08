@@ -106,14 +106,60 @@ def _download_headers(url: str) -> dict[str, str]:
             headers["Authorization"] = f"Bearer {token}"
     return headers
 
+
+def _preflight_huggingface_access(url: str, unique_id) -> None:
+    """Look up Hub metadata and tell the user if the repo is gated or private."""
+    if not _is_huggingface_url(url):
+        return
+    info = hf_auth.lookup_hf_repo_gate(url)
+    if not info:
+        return
+
+    has_token = bool(hf_auth.get_hf_token())
+    repo_id = info["repo_id"]
+    page_url = info["page_url"]
+
+    if info.get("inaccessible"):
+        message = (
+            f"{repo_id} looks private or blocked without Hugging Face login. "
+            "Run the HuggingFace Login node, confirm this account can open "
+            f"{page_url}, then retry."
+        )
+        PromptServer.instance.send_progress_text(message, unique_id)
+        if not has_token:
+            raise PermissionError(message)
+        return
+
+    if not info.get("gated"):
+        return
+
+    notice = f"Gated Hugging Face repo: {repo_id}."
+    PromptServer.instance.send_progress_text(notice, unique_id)
+    if not has_token:
+        raise PermissionError(
+            f"{notice} Run HuggingFace Login on this machine, then open {page_url} "
+            "in a browser and accept the license with the same account before retrying."
+        )
+    PromptServer.instance.send_progress_text(
+        f"Using the cached Hugging Face token. If download fails, accept the license at {page_url}.",
+        unique_id,
+    )
+
+
 def _download_file(url, destination_path, hidden: io.HiddenHolder):
     """Download a file."""
     headers = _download_headers(url)
     response = requests.get(url, stream=True, headers=headers)
-    if response.status_code in (401, 403) and _is_huggingface_url(url) and not headers.get("Authorization"):
+    if response.status_code in (401, 403) and _is_huggingface_url(url):
+        if not headers.get("Authorization"):
+            raise PermissionError(
+                "Hugging Face returned 401/403. This file is probably gated or private. "
+                "Run the HuggingFace Login node, accept the repo license on the model page, then retry."
+            )
         raise PermissionError(
-            "Hugging Face returned unauthorized. Run the HuggingFace Login node first "
-            "(Device Code), then retry the download."
+            "Hugging Face returned 401/403 even with a cached token. "
+            "The login may be expired, or this account has not accepted the gated license. "
+            "Open the model page and click Agree, or run HuggingFace Login with force_relogin."
         )
     response.raise_for_status()
     logging.info(f"Downloading {url} to {destination_path}")
@@ -225,7 +271,8 @@ class DownloadWhatIWantNode(io.ComfyNode):
             display_name="DownloadWhatIWant",
             description=(
                 "Download what I want. Hugging Face URLs use the cached HF token when available. "
-                "Viewer links (/blob/ or /tree/) are rewritten to /resolve/ before download."
+                "Viewer links (/blob/ or /tree/) are rewritten to /resolve/ before download. "
+                "Gated repos are detected before download and shown on the node."
             ),
             inputs=[
                 io.String.Input(
@@ -254,6 +301,7 @@ class DownloadWhatIWantNode(io.ComfyNode):
                 f"Normalized Hugging Face URL to {url}",
                 cls.hidden.unique_id,
             )
+        _preflight_huggingface_access(url, cls.hidden.unique_id)
         name_override = to_valid_filename(name_override.strip())
         matching_folder_paths = folder_paths.get_folder_paths(folder_name)
         first_folder_path = matching_folder_paths[0]

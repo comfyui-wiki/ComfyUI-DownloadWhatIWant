@@ -11,6 +11,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import requests
 
@@ -20,6 +21,17 @@ HF_ENDPOINT = "https://huggingface.co"
 # Official huggingface_hub CLI / library OAuth client id (public, no secret).
 DEVICE_CODE_OAUTH_CLIENT_ID = "26be6b09-91c5-47da-9861-d2d2bb7a7e36"
 _DEVICE_CODE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
+_HF_FILE_MARKERS = {"resolve", "blob", "tree"}
+_HF_RESERVED_NAMESPACES = {
+    "api",
+    "docs",
+    "login",
+    "settings",
+    "organizations",
+    "spaces",
+    "datasets",
+    "models",
+}
 
 
 def _hf_home() -> Path:
@@ -50,6 +62,87 @@ def get_hf_token() -> str | None:
     except OSError:
         logger.exception("Failed to read Hugging Face token from %s", path)
     return None
+
+
+def parse_hf_repo(url: str) -> tuple[str, str] | None:
+    """Return (repo_type, repo_id) from a Hugging Face URL, or None."""
+    parts = [part for part in urlparse(url.strip()).path.split("/") if part]
+    if not parts:
+        return None
+
+    repo_type = "model"
+    if parts[0].lower() in ("datasets", "spaces"):
+        repo_type = "dataset" if parts[0].lower() == "datasets" else "space"
+        parts = parts[1:]
+    if not parts or parts[0].lower() in _HF_RESERVED_NAMESPACES:
+        return None
+
+    if len(parts) >= 2 and parts[1].lower() in _HF_FILE_MARKERS:
+        repo_id = parts[0]
+    elif len(parts) >= 2:
+        repo_id = f"{parts[0]}/{parts[1]}"
+    else:
+        repo_id = parts[0]
+    return repo_type, repo_id
+
+
+def _repo_page_url(repo_type: str, repo_id: str) -> str:
+    if repo_type == "dataset":
+        return f"{HF_ENDPOINT}/datasets/{repo_id}"
+    if repo_type == "space":
+        return f"{HF_ENDPOINT}/spaces/{repo_id}"
+    return f"{HF_ENDPOINT}/{repo_id}"
+
+
+def lookup_hf_repo_gate(url: str) -> dict[str, Any] | None:
+    """Read Hub metadata to see if a repo is gated or private. None if unknown."""
+    parsed = parse_hf_repo(url)
+    if not parsed:
+        return None
+    repo_type, repo_id = parsed
+    api_kind = {"model": "models", "dataset": "datasets", "space": "spaces"}[repo_type]
+    headers: dict[str, str] = {}
+    token = get_hf_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        response = requests.get(
+            f"{HF_ENDPOINT}/api/{api_kind}/{repo_id}",
+            headers=headers,
+            timeout=15,
+        )
+    except requests.RequestException:
+        logger.exception("Failed to look up Hugging Face repo %s", repo_id)
+        return None
+
+    page_url = _repo_page_url(repo_type, repo_id)
+    if response.status_code in (401, 403):
+        return {
+            "repo_id": repo_id,
+            "repo_type": repo_type,
+            "gated": None,
+            "private": True,
+            "page_url": page_url,
+            "inaccessible": True,
+        }
+    if not response.ok:
+        return None
+
+    try:
+        info = response.json()
+    except ValueError:
+        return None
+
+    gated = info.get("gated", False)
+    return {
+        "repo_id": repo_id,
+        "repo_type": repo_type,
+        "gated": bool(gated),
+        "gated_mode": gated,
+        "private": bool(info.get("private")),
+        "page_url": page_url,
+        "inaccessible": False,
+    }
 
 
 def get_logged_in_username() -> str | None:
