@@ -1,16 +1,17 @@
 from __future__ import annotations
+import asyncio
+import logging
 import requests
 from tqdm import tqdm
 import shutil
 import re
 import os
-import time
 from urllib.parse import urlparse, urlunparse
 
+from aiohttp import web
 from comfy_api.latest import ComfyExtension, io
 import folder_paths
 import comfy.utils
-import logging
 from server import PromptServer
 import comfy.model_management
 
@@ -25,7 +26,8 @@ _hf_auth_spec.loader.exec_module(hf_auth)
 
 
 WEB_DIRECTORY = "./web"
-_HF_LOGIN_EVENT = "downloadwhatiwant.hf_login"
+_HF_AUTH_PREFIX = "/downloadwhatiwant/hf_auth"
+_routes_registered = False
 
 folder_names_and_paths_list = list(folder_paths.folder_names_and_paths.keys())
 
@@ -125,7 +127,7 @@ def _preflight_huggingface_access(url: str, unique_id) -> None:
     if info.get("inaccessible"):
         message = (
             f"{repo_id} looks private or blocked without Hugging Face login. "
-            "Run the HuggingFace Login node, confirm this account can open "
+            "Click Hugging Face Login on this node, confirm this account can open "
             f"{page_url}, then retry."
         )
         PromptServer.instance.send_progress_text(message, unique_id)
@@ -140,7 +142,7 @@ def _preflight_huggingface_access(url: str, unique_id) -> None:
     PromptServer.instance.send_progress_text(notice, unique_id)
     if not has_token:
         raise PermissionError(
-            f"{notice} Run HuggingFace Login on this machine, then open {page_url} "
+            f"{notice} Click Hugging Face Login on this node, then open {page_url} "
             "in a browser and accept the license with the same account before retrying."
         )
     PromptServer.instance.send_progress_text(
@@ -157,12 +159,12 @@ def _download_file(url, destination_path, hidden: io.HiddenHolder):
         if not headers.get("Authorization"):
             raise PermissionError(
                 "Hugging Face returned 401/403. This file is probably gated or private. "
-                "Run the HuggingFace Login node, accept the repo license on the model page, then retry."
+                "Click Hugging Face Login on this node, accept the repo license on the model page, then retry."
             )
         raise PermissionError(
             "Hugging Face returned 401/403 even with a cached token. "
             "The login may be expired, or this account has not accepted the gated license. "
-            "Open the model page and click Agree, or run HuggingFace Login with force_relogin."
+            "Open the model page and click Agree, or click Hugging Face Login again."
         )
     response.raise_for_status()
     logging.info(f"Downloading {url} to {destination_path}")
@@ -190,103 +192,6 @@ def _download_file(url, destination_path, hidden: io.HiddenHolder):
                         pbar.update_absolute(total_downloaded, total_size)
                     chunk_count += 1
 
-def _publish_hf_login_copyable(unique_id, device_info=None, *, waiting: bool = True, status: str = ""):
-    payload = {
-        "node": unique_id,
-        "user_code": (device_info or {}).get("user_code") or "",
-        "url": (device_info or {}).get("verification_uri_complete")
-        or (device_info or {}).get("verification_uri")
-        or "",
-        "waiting": waiting,
-        "status": status,
-    }
-    PromptServer.instance.send_sync(_HF_LOGIN_EVENT, payload)
-
-
-class HuggingFaceLoginNode(io.ComfyNode):
-    @classmethod
-    def define_schema(cls):
-        return io.Schema(
-            node_id="HuggingFaceLogin",
-            display_name="HuggingFace Login",
-            description=(
-                "Log in to Hugging Face on this ComfyUI machine via Device Code. "
-                "Copy the code or URL from the node, authorize in your local browser, then wait. "
-                "The token is stored on the remote instance for later downloads."
-            ),
-            category="utils/download",
-            inputs=[
-                io.Boolean.Input(
-                    "force_relogin",
-                    default=False,
-                    tooltip="If true, start a new Device Code login even when already logged in.",
-                ),
-            ],
-            outputs=[
-                io.String.Output("status", tooltip="Login status message."),
-                io.String.Output("username", tooltip="Logged-in Hugging Face username, if available."),
-            ],
-            hidden=[
-                io.Hidden.unique_id
-            ],
-            is_output_node=True,
-        )
-
-    @classmethod
-    def execute(cls, force_relogin: bool = False):
-        unique_id = cls.hidden.unique_id
-
-        if not force_relogin:
-            username = hf_auth.get_logged_in_username()
-            if username:
-                status = f"Already logged in as {username}. Token is cached on this machine."
-                PromptServer.instance.send_progress_text(status, unique_id)
-                _publish_hf_login_copyable(unique_id, waiting=False, status=status)
-                return io.NodeOutput(status, username)
-
-        device_info = hf_auth.request_device_code()
-        instructions = hf_auth.format_login_instructions(device_info)
-        logging.info(instructions)
-        PromptServer.instance.send_progress_text(instructions, unique_id)
-        _publish_hf_login_copyable(
-            unique_id,
-            device_info,
-            waiting=True,
-            status="Copy the code or URL below, then authorize in your browser.",
-        )
-
-        last_ping = time.time()
-
-        def on_pending():
-            nonlocal last_ping
-            now = time.time()
-            if now - last_ping >= 10:
-                PromptServer.instance.send_progress_text(
-                    "Still waiting for Hugging Face authorization. Copy the code or URL from the node.",
-                    unique_id,
-                )
-                last_ping = now
-
-        def should_abort():
-            comfy.model_management.throw_exception_if_processing_interrupted()
-
-        token_response = hf_auth.poll_device_token(
-            device_info,
-            on_pending=on_pending,
-            should_abort=should_abort,
-        )
-        username = hf_auth.save_oauth_token(token_response) or ""
-
-        status = (
-            f"Login successful. Logged in as {username or 'unknown'}. "
-            "Token is cached on this machine for future downloads."
-        )
-        PromptServer.instance.send_progress_text(status, unique_id)
-        _publish_hf_login_copyable(unique_id, waiting=False, status=status)
-        logging.info(status)
-        return io.NodeOutput(status, username)
-
-
 class DownloadWhatIWantNode(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -295,6 +200,7 @@ class DownloadWhatIWantNode(io.ComfyNode):
             display_name="DownloadWhatIWant",
             description=(
                 "Download what I want. Hugging Face URLs use the cached HF token when available. "
+                "Use the Hugging Face Login button on this node for gated repos. "
                 "Viewer links (/blob/ or /tree/) are rewritten to /resolve/ before download. "
                 "Gated repos are detected before download and shown on the node."
             ),
@@ -360,7 +266,41 @@ class DownloadWhatIWantNode(io.ComfyNode):
 
 class DownloadWhatIWantExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [DownloadWhatIWantNode, HuggingFaceLoginNode]
+        return [DownloadWhatIWantNode]
+
+
+def _register_hf_auth_routes() -> None:
+    global _routes_registered
+    if _routes_registered or PromptServer.instance is None:
+        return
+
+    routes = PromptServer.instance.routes
+
+    @routes.get(f"{_HF_AUTH_PREFIX}/status")
+    async def hf_auth_status(request):
+        refresh = request.query.get("refresh") == "1"
+        return web.json_response(hf_auth.login_session.snapshot(refresh_whoami=refresh))
+
+    @routes.post(f"{_HF_AUTH_PREFIX}/start")
+    async def hf_auth_start(request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        force = bool((body or {}).get("force_relogin"))
+        state = await asyncio.to_thread(hf_auth.login_session.start, force)
+        return web.json_response(state)
+
+    @routes.post(f"{_HF_AUTH_PREFIX}/cancel")
+    async def hf_auth_cancel(_request):
+        return web.json_response(hf_auth.login_session.cancel())
+
+    _routes_registered = True
+
+
+_register_hf_auth_routes()
+
 
 async def comfy_entrypoint():
+    _register_hf_auth_routes()
     return DownloadWhatIWantExtension()

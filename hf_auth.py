@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -231,7 +232,7 @@ def poll_device_token(
         if error == "access_denied":
             raise RuntimeError("Hugging Face authorization was denied.")
         if error in ("expired_token", "invalid_grant"):
-            raise RuntimeError("Hugging Face device code expired. Please run the login node again.")
+            raise RuntimeError("Hugging Face device code expired. Click Hugging Face Login on the download node again.")
         raise RuntimeError(
             f"Hugging Face login failed: {error or response.status_code} - {data.get('error_description', '')}"
         )
@@ -262,8 +263,142 @@ def format_login_instructions(device_info: dict[str, Any]) -> str:
     uri = device_info.get("verification_uri_complete") or device_info.get("verification_uri")
     code = device_info.get("user_code", "")
     return (
-        "Hugging Face login. Copy the code or URL from the node, then authorize.\n"
+        "Hugging Face login. Copy the code or URL from the download node, then authorize.\n"
         f"Code:\n{code}\n"
         f"URL:\n{uri}\n"
         "Waiting for authorization..."
     )
+
+
+class HfLoginSession:
+    """Single machine-wide Device Code login, driven by the download node button."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._abort = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._state: dict[str, Any] = {
+            "status": "idle",
+            "user_code": "",
+            "url": "",
+            "username": "",
+            "message": "Not logged in to Hugging Face.",
+        }
+
+    def snapshot(self, *, refresh_whoami: bool = False) -> dict[str, Any]:
+        with self._lock:
+            data = dict(self._state)
+        if data["status"] == "waiting":
+            return data
+        if not refresh_whoami:
+            return data
+        username = get_logged_in_username()
+        if username:
+            data = {
+                "status": "success",
+                "user_code": "",
+                "url": "",
+                "username": username,
+                "message": f"Logged in as {username}. Token is cached on this machine.",
+            }
+            with self._lock:
+                if self._state["status"] != "waiting":
+                    self._state = dict(data)
+            return data
+        if data["status"] != "error":
+            data = {
+                "status": "idle",
+                "user_code": "",
+                "url": "",
+                "username": "",
+                "message": "Not logged in to Hugging Face.",
+            }
+            with self._lock:
+                if self._state["status"] != "waiting":
+                    self._state = dict(data)
+        return data
+
+    def cancel(self) -> dict[str, Any]:
+        self._abort.set()
+        with self._lock:
+            if self._state["status"] == "waiting":
+                self._state = {
+                    "status": "idle",
+                    "user_code": "",
+                    "url": "",
+                    "username": "",
+                    "message": "Login cancelled.",
+                }
+            return dict(self._state)
+
+    def start(self, force_relogin: bool = False) -> dict[str, Any]:
+        with self._lock:
+            if self._state["status"] == "waiting" and self._thread and self._thread.is_alive():
+                return dict(self._state)
+
+        if not force_relogin:
+            username = get_logged_in_username()
+            if username:
+                data = {
+                    "status": "success",
+                    "user_code": "",
+                    "url": "",
+                    "username": username,
+                    "message": f"Already logged in as {username}. Token is cached on this machine.",
+                }
+                with self._lock:
+                    self._state = dict(data)
+                return data
+
+        device_info = request_device_code()
+        logger.info(format_login_instructions(device_info))
+        self._abort.clear()
+        data = {
+            "status": "waiting",
+            "user_code": device_info.get("user_code") or "",
+            "url": device_info.get("verification_uri_complete")
+            or device_info.get("verification_uri")
+            or "",
+            "username": "",
+            "message": "Copy the code or URL, then authorize in your browser.",
+        }
+        with self._lock:
+            self._state = dict(data)
+            self._thread = threading.Thread(target=self._poll, args=(device_info,), daemon=True)
+            self._thread.start()
+        return data
+
+    def _poll(self, device_info: dict[str, Any]) -> None:
+        def should_abort() -> None:
+            if self._abort.is_set():
+                raise RuntimeError("Hugging Face login was cancelled.")
+
+        try:
+            token_response = poll_device_token(device_info, should_abort=should_abort)
+            username = save_oauth_token(token_response) or ""
+            with self._lock:
+                self._state = {
+                    "status": "success",
+                    "user_code": "",
+                    "url": "",
+                    "username": username,
+                    "message": (
+                        f"Login successful. Logged in as {username or 'unknown'}. "
+                        "Token is cached on this machine."
+                    ),
+                }
+        except Exception as exc:
+            cancelled = "cancelled" in str(exc).lower()
+            with self._lock:
+                if cancelled and self._state["status"] == "idle":
+                    return
+                self._state = {
+                    "status": "idle" if cancelled else "error",
+                    "user_code": "",
+                    "url": "",
+                    "username": "",
+                    "message": str(exc),
+                }
+
+
+login_session = HfLoginSession()
