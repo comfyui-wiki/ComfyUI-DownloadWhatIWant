@@ -4,6 +4,7 @@ from tqdm import tqdm
 import shutil
 import re
 import os
+import time
 
 from comfy_api.latest import ComfyExtension, io
 import folder_paths
@@ -12,6 +13,14 @@ import logging
 from server import PromptServer
 import comfy.model_management
 
+# Folder name may contain hyphens, so avoid package-relative imports.
+import importlib.util
+
+_HF_AUTH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hf_auth.py")
+_hf_auth_spec = importlib.util.spec_from_file_location("downloadwhatiwant_hf_auth", _HF_AUTH_PATH)
+hf_auth = importlib.util.module_from_spec(_hf_auth_spec)
+assert _hf_auth_spec.loader is not None
+_hf_auth_spec.loader.exec_module(hf_auth)
 
 
 folder_names_and_paths_list = list(folder_paths.folder_names_and_paths.keys())
@@ -56,13 +65,35 @@ def _validate_file_extension(file_name):
     if extension not in (".safetensors", ".sft", ".txt", ".csv", ".json", ".yaml"):
         raise ValueError(f"Unsupported unsafe file for download: {file_name}")
 
+def _is_huggingface_url(url: str) -> bool:
+    host = re.sub(r"^https?://", "", url.strip(), flags=re.IGNORECASE).split("/", 1)[0].lower()
+    return (
+        host == "huggingface.co"
+        or host.endswith(".huggingface.co")
+        or host == "hf.co"
+        or host.endswith(".hf.co")
+    )
+
+def _download_headers(url: str) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if _is_huggingface_url(url):
+        token = hf_auth.get_hf_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    return headers
+
 def _download_file(url, destination_path, hidden: io.HiddenHolder):
     """Download a file."""
-    response = requests.get(url, stream=True)
+    headers = _download_headers(url)
+    response = requests.get(url, stream=True, headers=headers)
+    if response.status_code in (401, 403) and _is_huggingface_url(url) and not headers.get("Authorization"):
+        raise PermissionError(
+            "Hugging Face returned unauthorized. Run the HuggingFace Login node first "
+            "(Device Code), then retry the download."
+        )
+    response.raise_for_status()
     logging.info(f"Downloading {url} to {destination_path}")
     display_modulus = 200
-
-    
 
     with open(destination_path, "wb") as f:
         total_size = int(response.headers.get("content-length", 0))
@@ -86,13 +117,89 @@ def _download_file(url, destination_path, hidden: io.HiddenHolder):
                         pbar.update_absolute(total_downloaded, total_size)
                     chunk_count += 1
 
+class HuggingFaceLoginNode(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="HuggingFaceLogin",
+            display_name="HuggingFace Login",
+            description=(
+                "Log in to Hugging Face on this ComfyUI machine via Device Code. "
+                "Open the shown URL in your local browser, enter the code, then wait. "
+                "The token is stored on the remote instance for later downloads."
+            ),
+            category="utils/download",
+            inputs=[
+                io.Boolean.Input(
+                    "force_relogin",
+                    default=False,
+                    tooltip="If true, start a new Device Code login even when already logged in.",
+                ),
+            ],
+            outputs=[
+                io.String.Output("status", tooltip="Login status message."),
+                io.String.Output("username", tooltip="Logged-in Hugging Face username, if available."),
+            ],
+            hidden=[
+                io.Hidden.unique_id
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, force_relogin: bool = False):
+        unique_id = cls.hidden.unique_id
+
+        if not force_relogin:
+            username = hf_auth.get_logged_in_username()
+            if username:
+                status = f"Already logged in as {username}. Token is cached on this machine."
+                PromptServer.instance.send_progress_text(status, unique_id)
+                return io.NodeOutput(status, username)
+
+        device_info = hf_auth.request_device_code()
+        instructions = hf_auth.format_login_instructions(device_info)
+        logging.info(instructions)
+        PromptServer.instance.send_progress_text(instructions, unique_id)
+
+        last_ping = time.time()
+
+        def on_pending():
+            nonlocal last_ping
+            now = time.time()
+            if now - last_ping >= 10:
+                PromptServer.instance.send_progress_text(
+                    f"Still waiting for Hugging Face authorization. Code: {device_info.get('user_code')}",
+                    unique_id,
+                )
+                last_ping = now
+
+        def should_abort():
+            comfy.model_management.throw_exception_if_processing_interrupted()
+
+        token_response = hf_auth.poll_device_token(
+            device_info,
+            on_pending=on_pending,
+            should_abort=should_abort,
+        )
+        username = hf_auth.save_oauth_token(token_response) or ""
+
+        status = (
+            f"Login successful. Logged in as {username or 'unknown'}. "
+            "Token is cached on this machine for future downloads."
+        )
+        PromptServer.instance.send_progress_text(status, unique_id)
+        logging.info(status)
+        return io.NodeOutput(status, username)
+
+
 class DownloadWhatIWantNode(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
             node_id="DownloadWhatIWant",
             display_name="DownloadWhatIWant",
-            description="Download what I want.",
+            description="Download what I want. Hugging Face URLs use the cached HF token when available.",
             inputs=[
                 io.String.Input("url", tooltip="The URL of the file to download."),
                 io.String.Input("name_override", tooltip="What to call the name after downloading."),
@@ -140,7 +247,7 @@ class DownloadWhatIWantNode(io.ComfyNode):
 
 class DownloadWhatIWantExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [DownloadWhatIWantNode]
+        return [DownloadWhatIWantNode, HuggingFaceLoginNode]
 
 async def comfy_entrypoint():
     return DownloadWhatIWantExtension()
