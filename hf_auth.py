@@ -262,6 +262,8 @@ def format_login_instructions(device_info: dict[str, Any]) -> str:
     uri = device_info.get("verification_uri_complete") or device_info.get("verification_uri")
     code = device_info.get("user_code", "")
     return (
-        f"Hugging Face login: open {uri} and enter code {code}. "
+        "Hugging Face login. Copy the code or URL from the node, then authorize.\n"
+        f"Code:\n{code}\n"
+        f"URL:\n{uri}\n"
         "Waiting for authorization..."
     )

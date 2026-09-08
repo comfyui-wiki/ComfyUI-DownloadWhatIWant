@@ -24,6 +24,9 @@ assert _hf_auth_spec.loader is not None
 _hf_auth_spec.loader.exec_module(hf_auth)
 
 
+WEB_DIRECTORY = "./web"
+_HF_LOGIN_EVENT = "downloadwhatiwant.hf_login"
+
 folder_names_and_paths_list = list(folder_paths.folder_names_and_paths.keys())
 
 
@@ -187,6 +190,19 @@ def _download_file(url, destination_path, hidden: io.HiddenHolder):
                         pbar.update_absolute(total_downloaded, total_size)
                     chunk_count += 1
 
+def _publish_hf_login_copyable(unique_id, device_info=None, *, waiting: bool = True, status: str = ""):
+    payload = {
+        "node": unique_id,
+        "user_code": (device_info or {}).get("user_code") or "",
+        "url": (device_info or {}).get("verification_uri_complete")
+        or (device_info or {}).get("verification_uri")
+        or "",
+        "waiting": waiting,
+        "status": status,
+    }
+    PromptServer.instance.send_sync(_HF_LOGIN_EVENT, payload)
+
+
 class HuggingFaceLoginNode(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -195,7 +211,7 @@ class HuggingFaceLoginNode(io.ComfyNode):
             display_name="HuggingFace Login",
             description=(
                 "Log in to Hugging Face on this ComfyUI machine via Device Code. "
-                "Open the shown URL in your local browser, enter the code, then wait. "
+                "Copy the code or URL from the node, authorize in your local browser, then wait. "
                 "The token is stored on the remote instance for later downloads."
             ),
             category="utils/download",
@@ -225,12 +241,19 @@ class HuggingFaceLoginNode(io.ComfyNode):
             if username:
                 status = f"Already logged in as {username}. Token is cached on this machine."
                 PromptServer.instance.send_progress_text(status, unique_id)
+                _publish_hf_login_copyable(unique_id, waiting=False, status=status)
                 return io.NodeOutput(status, username)
 
         device_info = hf_auth.request_device_code()
         instructions = hf_auth.format_login_instructions(device_info)
         logging.info(instructions)
         PromptServer.instance.send_progress_text(instructions, unique_id)
+        _publish_hf_login_copyable(
+            unique_id,
+            device_info,
+            waiting=True,
+            status="Copy the code or URL below, then authorize in your browser.",
+        )
 
         last_ping = time.time()
 
@@ -239,7 +262,7 @@ class HuggingFaceLoginNode(io.ComfyNode):
             now = time.time()
             if now - last_ping >= 10:
                 PromptServer.instance.send_progress_text(
-                    f"Still waiting for Hugging Face authorization. Code: {device_info.get('user_code')}",
+                    "Still waiting for Hugging Face authorization. Copy the code or URL from the node.",
                     unique_id,
                 )
                 last_ping = now
@@ -259,6 +282,7 @@ class HuggingFaceLoginNode(io.ComfyNode):
             "Token is cached on this machine for future downloads."
         )
         PromptServer.instance.send_progress_text(status, unique_id)
+        _publish_hf_login_copyable(unique_id, waiting=False, status=status)
         logging.info(status)
         return io.NodeOutput(status, username)
 
